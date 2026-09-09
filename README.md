@@ -1,90 +1,91 @@
 # cc-usage-tui
 
 A **read-only**, near-realtime terminal dashboard for [cc-switch](https://github.com/farion1231/cc-switch)'s
-token/cost usage. It tails cc-switch's SQLite database and shows, per agent tool
-(codex, opencode, claude, pi, grokbuild, …), the **real** consumption:
+token/cost usage. It tails cc-switch's SQLite database and, after each write,
+shows the **real** consumption per agent tool / provider / model: requests,
+fresh (non-cached) input, cache-read, output, total tokens, **cache-hit rate**,
+cost, and success rate.
 
-- requests
-- fresh (non-cached) input tokens
-- cache-read tokens
-- output tokens
-- total tokens
-- **cache hit rate**
-- total cost (USD)
+Five pages, one global filter that drives all of them:
+
+| page | shows |
+|---|---|
+| **Overview** | usage by agent (codex, opencode, claude, pi, grokbuild, …) |
+| **Trend** | time-series chart — Tokens (fresh/cache/output), Cost, or Requests; hourly for Today, daily otherwise |
+| **Requests** | paginated per-request log + detail pane (latency, first-token, source, error…) |
+| **Providers** | usage by provider (with `providers.name`, session fallbacks, success %, avg latency) |
+| **Models** | usage by **effective pricing model** (`COALESCE(NULLIF(pricing_model,''), model)`) with avg tokens/req |
 
 ```
-┌ cc-switch usage ───────────────────────────────────────────────────────────────┐
-│DB C:\Users\you\.cc-switch\cc-switch.db                                          │
-│journal DELETE  ·  2.64 MB  ·   READ-ONLY   ·  rows raw 3,321 / rollups 55       │
-│last write 06:50:58 UTC (2m ago)  ·  refreshed 06:53:02 UTC (1x)                 │
-│range All history  ·  view Agents  ·  sort Cost  ·  [ok]                         │
-└─────────────────────────────────────────────────────────────────────────────────┘
-┌ Usage by agent ────────────────────────────────────────────────────────────────┐
-│  Agent                    Reqs   Fresh In  Cache Read    Output   Total Tok  Hit %       Cost│
-│▸ codex                   3,707     12.65M     442.52M     1.44M     456.61M   97.2%     $327.60│
-│  opencode                2,290     15.88M     146.61M     2.49M     164.98M   90.2%      $57.47│
-│  claude                  1,197      2.25M     112.14M    646.7K     117.40M   96.1%      $38.48│
-│  ...                                                                       │
-│  TOTAL                    7,885     38.71M     708.07M     4.78M     753.91M   94.5%     $424.22│
-└─────────────────────────────────────────────────────────────────────────────────┘
- q quit   r refresh   t range   v view   s sort   ↑↓/jk select   (auto-refreshes on each write)
+Requests 7,966   Tokens 768.18M   Hit 94.6%   Cost $428.98   Success 99.1%
+DB C:\Users\you\.cc-switch\cc-switch.db · DELETE · 2.64MB · READ-ONLY · last write 16:21:30 (40s ago)
+status [ok] · filters affect every page · local-time ranges
+  Overview   Trend   Requests  [Providers]  Models
+Range: [All]  Agent: [All]  Provider: [All]  Model: [All]
+┌ Usage by provider ───────────────────────────────────────────────────────────┐
+│  Provider              Agent        Reqs    Tokens      Cost  Success  Avg Lat│
+│▸ Codex (Session)       codex       3,712   456.71M   $327.92   100.0%     0ms│
+│  PackyCode             claude        309    26.80M    $22.29    99.4%   14.21s│
+│  ...                                                                         │
+└───────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Why read-only, and how it stays safe
+## Read-only & refresh model (unchanged guarantees)
 
-cc-switch keeps `cc-switch.db` open and writes to it in realtime (one row per API
-request). This tool **never writes**:
+- Opens with `SQLITE_OPEN_READ_ONLY` — never writes, never creates `-wal`/`-journal`.
+- `busy_timeout=2s` so a read waits instead of failing when cc-switch holds the
+  write lock (cc-switch uses `journal_mode=DELETE`, where readers/writers are
+  mutually exclusive). On any error it keeps the last good data and shows
+  `[db busy — retrying…]`.
+- Event loop polls the file **mtime every 200 ms**; on change it re-queries, so the
+  view updates right after each cc-switch write (plus a 5 s fallback).
+- **Page-aware refresh**: each refresh runs only `meta + summary + current page`
+  queries (not every page), and `filter_options` only reloads when a filter or the
+  range changes — so one write stays cheap.
+- Never creates indexes or mutates cc-switch's schema.
 
-- Opens the file with `SQLITE_OPEN_READ_ONLY` — it cannot create `-wal`/`-journal`
-  files or mutate anything.
-- Sets a per-connection `busy_timeout` (2 s) so that if cc-switch holds the write
-  lock at that instant, the read simply waits instead of failing with
-  `SQLITE_BUSY`. cc-switch uses `journal_mode=DELETE`, where readers and writers
-  are mutually exclusive, so this matters.
-- On any lock/error it keeps the last good data and shows `[db busy — retrying…]`
-  in the status line rather than crashing.
+## Data model — aligned with cc-switch's Dashboard
 
-**Refresh model:** the event loop polls the file's mtime every 200 ms; when it
-changes (i.e. cc-switch wrote), it re-queries — so the view updates right after
-each write. A 5 s fallback refresh covers the rare case where mtime is unreliable.
-
-## Data model (why the numbers are "real")
-
-cc-switch stores usage in two complementary, non-overlapping tables:
+cc-switch keeps two complementary, **non-overlapping** tables (raw rows are pruned
+once rolled up):
 
 | table | contents | window |
 |---|---|---|
-| `proxy_request_logs` | per-request rows (live) | recent (~last weeks) |
-| `usage_daily_rollups` | pre-aggregated daily rows (archived) | older |
+| `proxy_request_logs` | per-request rows (live) | recent |
+| `usage_daily_rollups` | pre-aggregated daily rows | older |
 
-Old rows are rolled up and pruned, so summing both gives full history with **no
-double counting** (the tool asserts the ranges don't overlap by construction).
+All aggregation SQL mirrors cc-switch's own conventions so the numbers match its
+web UI (see `src/db.rs`):
 
-Token accounting differs per source and is normalized via `input_token_semantics`:
-
-- `1` → `input_tokens` **already includes** `cache_read` (cache-inclusive)
-- `2` → `input_tokens` **excludes** `cache_read` (fresh only)
-- `0` → unknown; decided by agent — **codex/grokbuild** report cache-inclusive,
-  **opencode/pi/claude** report fresh-only.
-
-Everything is normalized into `fresh`, `cache_read`, `cache_creation`, `output`,
-so totals and cache-hit rate are consistent across agents.
-`cache_hit = cache_read / (fresh + cache_read + cache_creation)`.
-Cost is taken from cc-switch's own `total_cost_usd` (not recomputed).
+- **Fresh input** via `input_token_semantics` + agent rules:
+  `sem=2 → input`; `sem=1` (cache-inclusive agents) `→ input − read − create`;
+  `sem=0` (cache-inclusive agents) `→ input − read`; else `→ input`.
+  Cache-inclusive agents: **codex, gemini, grokbuild**.
+- **Effective model** = `COALESCE(NULLIF(pricing_model,''), model)`.
+- **Display agent**: `claude-desktop → claude` (details still keep the real app_type).
+- **Provider name**: `providers.name`, else a `(Session)` fallback for
+  `_session/_codex_session/_gemini_session/_opencode_session/_grok_session/_pi_session`,
+  else the raw id.
+- **Cross-source dedup** (proxy vs session for the same call) via a fingerprint
+  window — a **no-op** when only one source exists (current cc-switch data is
+  session-only), present for parity with upstream.
+- **Time ranges use LOCAL dates** (chrono), and ranges merge raw detail +
+  full-day rollups, so `7d`/`30d` still see history after raw rows are pruned.
+  `Live` is the only raw-only range.
 
 ## Build
 
-Requires Rust (MSVC toolchain on Windows). `rusqlite` compiles a bundled SQLite,
-which needs a C compiler, so on Windows build through the MSVC environment:
+Rust (MSVC toolchain on Windows). `rusqlite` compiles a bundled SQLite, which
+needs a C compiler, so on Windows build through the MSVC environment:
 
 ```bat
 build.bat
 ```
 
 `build.bat` locates Visual Studio / Build Tools via `vswhere`, enters `vcvars64`,
-and runs `cargo build --release`. Binary: `target\release\cc-usage-tui.exe`.
+and runs `cargo build --release` → `target\release\cc-usage-tui.exe`.
 
-On macOS/Linux (system or bundled SQLite both fine):
+macOS/Linux:
 
 ```sh
 cargo build --release
@@ -96,64 +97,91 @@ cargo build --release
 cc-usage-tui [DB_PATH] [OPTIONS]
 ```
 
-- `DB_PATH` defaults to `%USERPROFILE%\.cc-switch\cc-switch.db` (or `$HOME/.cc-switch/cc-switch.db`).
-
-Options:
+- `DB_PATH` defaults to `%USERPROFILE%\.cc-switch\cc-switch.db` (`$HOME/.cc-switch/cc-switch.db`).
 
 | flag | meaning |
 |---|---|
 | *(none)* | launch the interactive TUI |
-| `--dump` | print a one-shot text report and exit (no TUI) |
-| `--frame` | render a single TUI frame as text and exit (no tty needed; great for screenshots/CI) |
-| `--by-model` | break down by model instead of by agent (with `--dump`/`--frame`) |
-| `--range <R>` | `all` (default) · `live` (raw logs only) · `today` · `7` · `30` |
-| `--interval <ms>` | mtime poll interval for write detection (default 200) |
+| `--dump` | one-shot text report and exit (no TUI) |
+| `--by-model` | with `--dump`, report by model instead of agent |
+| `--frame` | render one TUI frame as text and exit (no tty; good for screenshots/CI) |
+| `--page <P>` | with `--frame`: `overview\|trend\|requests\|providers\|models` |
+| `--range <R>` | `all` (default) · `live` · `today` · `7` · `30` |
+| `--interval <ms>` | mtime poll interval (default 200) |
 
 Examples:
 
 ```bat
-:: live dashboard on the default db
-cc-usage-tui
-
-:: text report of everything, per agent
-cc-usage-tui --dump
-
-:: per-model breakdown of the last 7 days
-cc-usage-tui --dump --by-model --range 7
-
-:: analyze a specific backup snapshot
-cc-usage-tui --dump "C:\Users\you\.cc-switch\backups\db_backup_YYYYMMDD_HHMMSS.db"
+cc-usage-tui                                  :: live dashboard (default db)
+cc-usage-tui --dump                           :: text report, per agent
+cc-usage-tui --dump --by-model --range 7      :: per-model, last 7 days
+cc-usage-tui --frame --page trend             :: text screenshot of the Trend page
+cc-usage-tui --dump "…\backups\db_backup_YYYYMMDD_HHMMSS.db"   :: analyze a snapshot
 ```
 
-TUI keybindings:
+### Keys
 
 | key | action |
 |---|---|
 | `q` / `Esc` / `Ctrl-C` | quit |
-| `r` | refresh now |
+| `r` | refresh now (also reloads filter options) |
+| `Tab` / `1`–`5` / `←` `→` | switch page |
 | `t` | cycle range (All → Live → 30d → 7d → Today) |
-| `v` | toggle Agents ↔ Models view |
-| `s` | cycle sort (Cost → Total tokens → Requests → Cache hit → Name) |
-| `↑`/`↓` or `k`/`j` | move selection |
+| `a` / `p` / `m` | open agent / provider / model picker (cascading) |
+| `s` | cycle sort (Cost → Tokens → Reqs → Hit%/Success → Name) |
+| `↑`/`↓` or `k`/`j`, `PgUp`/`PgDn`, `Home`/`End` | move selection |
+| `Enter` / click a row | drill down (set that agent/model/provider as filter) |
+| Trend: `x` | cycle metric (Tokens/Cost/Requests) |
+| Requests: `f`, `n`/`b` | cycle status filter, next/prev page |
+| picker: `↑`/`↓`, `Enter`, `Esc` | choose / confirm / cancel |
+
+### Mouse
+
+Left-click tabs, filter chips, and table rows; wheel scrolls the selection.
+(Only left-click + wheel are handled to avoid event spam.)
+
+## Architecture
+
+```
+src/
+├── main.rs        CLI, terminal lifecycle, event loop (no business logic)
+├── lib.rs         exposes the modules (so tests/ can use them)
+├── app.rs         App/Page/UsageFilter/UiAction + per-page state + apply()/refresh
+├── input.rs       keyboard + mouse → UiAction (one path for both)
+├── db.rs          read-only Reader, SQL helpers, all queries
+└── ui/
+    ├── mod.rs     layout + page router + hit-region collection
+    ├── common.rs  formatting, header/tabs/filter bar/footer/popup
+    ├── overview.rs  trend.rs  requests.rs  stats.rs
+tests/
+└── db_queries.rs  15 tests over an in-memory SQLite: semantics, dedup, ranges,
+                   provider fallback, effective model, pagination, filters
+```
+
+Data + control flow: `keyboard/mouse → UiAction → App::apply() → Reader (read-only)`.
+UI is a pure projection of `App`; hit regions are rebuilt every frame so mouse
+coordinates survive resizes.
+
+Run the tests:
+
+```sh
+cargo test          # 15 passed
+```
 
 ## Reuse / credits
 
-Built on existing wheels rather than reinventing:
-
-- [ratatui](https://crates.io/crates/ratatui) `0.29` — TUI framework (pinned to
-  0.29's stable API; 0.30 is a fresh modular rewrite).
-- [crossterm](https://crates.io/crates/crossterm) `0.28` — terminal backend/input.
-- [rusqlite](https://crates.io/crates/rusqlite) `0.40` (`bundled`) — SQLite.
-- [anyhow](https://crates.io/crates/anyhow) — errors.
-
-Conceptual prior art: [`ccusage`](https://github.com/ryoppippi/ccusage) (a
-TypeScript CLI that visualizes Claude Code usage) — but it reads `~/.claude`
-JSONL logs, not cc-switch's SQLite, so no existing tool fit this data source.
+- [ratatui](https://crates.io/crates/ratatui) `0.29` (0.30 is a fresh modular rewrite),
+  [crossterm](https://crates.io/crates/crossterm) `0.28`,
+  [rusqlite](https://crates.io/crates/rusqlite) `0.40` (`bundled`),
+  [chrono](https://crates.io/crates/chrono) `0.4`,
+  [anyhow](https://crates.io/crates/anyhow) `1`.
+- Prior art: [`ccusage`](https://github.com/ryoppippi/ccusage) (TypeScript, reads
+  Claude Code JSONL — a different data source), so no existing tool fit cc-switch's
+  SQLite; the SQL conventions here mirror cc-switch's own Dashboard.
 
 ## Notes / limitations
 
-- Times are shown in UTC (matching cc-switch's epoch `created_at`).
-- If cc-switch ever changes its schema or token semantics, adjust the
-  normalization in `src/db.rs` (`is_cache_inclusive` / `fresh_input`).
-- `cache_creation` tokens are folded into totals and hit-rate; they are currently
-  zero for all sources in this database.
+- Times are shown in **local** time (matching cc-switch's local-date Dashboard).
+- If cc-switch changes its schema/token semantics, adjust the helpers in `src/db.rs`.
+- `cache_creation` is folded into totals/hit-rate (currently zero for all sources).
+- Mouse header-click sorting is not wired; use `s` to cycle sort.
